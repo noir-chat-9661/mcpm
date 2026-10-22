@@ -33,10 +33,15 @@ type startResult struct {
 }
 
 type backendProc struct {
-	cmd       *exec.Cmd
-	pid       int
-	stdin     io.WriteCloser
-	logFile   *os.File
+	procMu     sync.Mutex
+	cmd        *exec.Cmd
+	pid        int
+	stdin      io.WriteCloser
+	logFile    *os.File
+	stopping   bool
+	cancelInit context.CancelFunc
+	specHash   string
+
 	writeMu   sync.Mutex
 	exited    chan struct{}
 	closeOnce sync.Once
@@ -49,6 +54,22 @@ type backendProc struct {
 	readyRes *startResult
 }
 
+func (bp *backendProc) requestStop() (io.WriteCloser, int) {
+	bp.procMu.Lock()
+	defer bp.procMu.Unlock()
+	bp.stopping = true
+	if bp.cancelInit != nil {
+		bp.cancelInit()
+	}
+	return bp.stdin, bp.pid
+}
+
+func (bp *backendProc) isStopping() bool {
+	bp.procMu.Lock()
+	defer bp.procMu.Unlock()
+	return bp.stopping
+}
+
 func (bp *backendProc) markExited(err error) {
 	bp.closeOnce.Do(func() {
 		bp.exitErr = err
@@ -59,8 +80,12 @@ func (bp *backendProc) markExited(err error) {
 			delete(bp.pending, id)
 		}
 		bp.pendMu.Unlock()
-		if bp.logFile != nil {
-			_ = bp.logFile.Close()
+		bp.procMu.Lock()
+		lf := bp.logFile
+		bp.logFile = nil
+		bp.procMu.Unlock()
+		if lf != nil {
+			_ = lf.Close()
 		}
 	})
 }
@@ -73,7 +98,13 @@ func (bp *backendProc) sendRaw(line []byte) error {
 		return errors.New("MCP プロセスは既に終了しています")
 	default:
 	}
-	if _, err := bp.stdin.Write(append(bytes.TrimRight(line, "\r\n"), '\n')); err != nil {
+	bp.procMu.Lock()
+	stdin := bp.stdin
+	bp.procMu.Unlock()
+	if stdin == nil {
+		return errors.New("MCP プロセスの標準入力が未初期化です")
+	}
+	if _, err := stdin.Write(append(bytes.TrimRight(line, "\r\n"), '\n')); err != nil {
 		return err
 	}
 	return nil
@@ -172,7 +203,10 @@ func NewMCPUnit(name string, cfg ServerConfig, globalIdle string, logger *log.Lo
 		subscribers: map[uint64]chan []byte{},
 	}
 	if c, err := LoadServerCache(name); err == nil {
-		u.cache = c
+		if c.SpecHash == "" || c.SpecHash == cfg.SpecHash() {
+			c.SpecHash = cfg.SpecHash()
+			u.cache = c
+		}
 	}
 	return u
 }
@@ -213,7 +247,8 @@ func (u *MCPUnit) Subscribe() (uint64, <-chan []byte, func()) {
 			}
 			u.disconnectTimer = time.AfterFunc(DisconnectGrace, func() {
 				u.mu.Lock()
-				stillIdle := u.activeClients == 0 && u.inFlight == 0 && u.status == "running" && !u.shuttingDown
+				stillIdle := u.activeClients == 0 && u.inFlight == 0 &&
+					(u.status == "running" || u.status == "starting") && !u.shuttingDown
 				u.mu.Unlock()
 				if stillIdle {
 					_ = u.Stop("全クライアント切断", true)
@@ -292,11 +327,14 @@ func (u *MCPUnit) EnsureRunning(ctx context.Context, reason string, manual bool)
 		return nil, fmt.Errorf("%s は直前の起動に失敗しています（mcpm logs %s を確認してください）", u.name, u.name)
 	}
 
+	initCtx, cancelInit := context.WithTimeout(context.Background(), ReadyTimeout)
 	res := &startResult{done: make(chan struct{})}
 	bp := &backendProc{
-		exited:   make(chan struct{}),
-		pending:  map[uint64]chan RPCMessage{},
-		readyRes: res,
+		exited:     make(chan struct{}),
+		pending:    map[uint64]chan RPCMessage{},
+		readyRes:   res,
+		cancelInit: cancelInit,
+		specHash:   u.cfg.SpecHash(),
 	}
 	u.status = "starting"
 	u.proc = bp
@@ -314,7 +352,7 @@ func (u *MCPUnit) EnsureRunning(ctx context.Context, reason string, manual bool)
 		u.logger.Printf("起動 %s（%s）", u.name, reason)
 	}
 
-	go u.spawnAndInit(bp, res)
+	go u.spawnAndInit(initCtx, bp, res)
 
 	select {
 	case <-ctx.Done():
@@ -327,28 +365,40 @@ func (u *MCPUnit) EnsureRunning(ctx context.Context, reason string, manual bool)
 	}
 }
 
-func (u *MCPUnit) spawnAndInit(bp *backendProc, res *startResult) {
+func (u *MCPUnit) spawnAndInit(initCtx context.Context, bp *backendProc, res *startResult) {
+	defer func() {
+		if bp.cancelInit != nil {
+			bp.cancelInit()
+		}
+	}()
 	finish := func(err error) {
 		res.err = err
 		close(res.done)
 	}
 
+	u.mu.Lock()
+	cfg := u.cfg
+	u.mu.Unlock()
+
 	logPath := filepath.Join(LogDir(), u.name+".log")
 	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
+		bp.markExited(err)
 		u.markFailed(bp, fmt.Sprintf("ログファイルを開けません: %v", err))
 		finish(err)
 		return
 	}
+	bp.procMu.Lock()
 	bp.logFile = lf
+	bp.procMu.Unlock()
 	_, _ = fmt.Fprintf(lf, "\n=== mcpm: %s start (%s) ===\n", u.name, time.Now().Format(time.RFC3339))
 
-	cmd := exec.Command(u.cfg.Command, u.cfg.Args...)
-	if u.cfg.Cwd != "" {
-		cmd.Dir = u.cfg.Cwd
+	cmd := exec.Command(cfg.Command, cfg.Args...)
+	if cfg.Cwd != "" {
+		cmd.Dir = cfg.Cwd
 	}
 	env := os.Environ()
-	for k, v := range u.cfg.Env {
+	for k, v := range cfg.Env {
 		env = append(env, k+"="+v)
 	}
 	cmd.Env = env
@@ -357,27 +407,45 @@ func (u *MCPUnit) spawnAndInit(bp *backendProc, res *startResult) {
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		bp.markExited(err)
 		u.markFailed(bp, err.Error())
 		finish(err)
 		return
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		_ = stdin.Close()
+		bp.markExited(err)
 		u.markFailed(bp, err.Error())
 		finish(err)
 		return
 	}
 
+	bp.procMu.Lock()
+	if bp.stopping {
+		bp.procMu.Unlock()
+		_ = stdin.Close()
+		_ = stdout.Close()
+		stopErr := errors.New("起動中に停止されました")
+		bp.markExited(stopErr)
+		finish(stopErr)
+		return
+	}
 	if err := cmd.Start(); err != nil {
-		_, _ = fmt.Fprintf(lf, "[ERROR] failed to start command %q: %v\n", u.cfg.Command, err)
+		bp.procMu.Unlock()
+		_ = stdin.Close()
+		_ = stdout.Close()
+		_, _ = fmt.Fprintf(lf, "[ERROR] failed to start command %q: %v\n", cfg.Command, err)
+		bp.markExited(err)
 		u.markFailed(bp, err.Error())
 		finish(fmt.Errorf("%s の起動に失敗しました: %w", u.name, err))
 		return
 	}
-
 	bp.cmd = cmd
 	bp.stdin = stdin
 	bp.pid = cmd.Process.Pid
+	pid := bp.pid
+	bp.procMu.Unlock()
 
 	go u.readStdout(bp, stdout)
 	go func() {
@@ -385,9 +453,6 @@ func (u *MCPUnit) spawnAndInit(bp *backendProc, res *startResult) {
 		bp.markExited(waitErr)
 		u.onProcessExited(bp, waitErr)
 	}()
-
-	initCtx, cancel := context.WithTimeout(context.Background(), ReadyTimeout)
-	defer cancel()
 
 	initParams, _ := json.Marshal(map[string]any{
 		"protocolVersion": DefaultProtocolVer,
@@ -399,13 +464,13 @@ func (u *MCPUnit) spawnAndInit(bp *backendProc, res *startResult) {
 	})
 	resp, err := bp.call(initCtx, "initialize", initParams)
 	if err != nil {
-		killProcessGroup(bp.pid)
+		killProcessGroup(pid)
 		u.markFailed(bp, err.Error())
 		finish(fmt.Errorf("%s の initialize に失敗しました: %w", u.name, err))
 		return
 	}
 	if resp.Error != nil {
-		killProcessGroup(bp.pid)
+		killProcessGroup(pid)
 		errMsg := fmt.Sprintf("initialize error (%d): %s", resp.Error.Code, resp.Error.Message)
 		u.markFailed(bp, errMsg)
 		finish(errors.New(errMsg))
@@ -418,35 +483,43 @@ func (u *MCPUnit) spawnAndInit(bp *backendProc, res *startResult) {
 		Method:  "notifications/initialized",
 	})
 	if err := bp.sendRaw(initNotif); err != nil {
-		killProcessGroup(bp.pid)
+		killProcessGroup(pid)
 		u.markFailed(bp, err.Error())
 		finish(err)
 		return
 	}
 
 	u.mu.Lock()
-	needCache := u.cache == nil
+	needCache := u.cache == nil || u.cache.SpecHash != bp.specHash
 	u.mu.Unlock()
 	if needCache {
 		if c, err := u.fetchMetadataFromProc(initCtx, bp); err == nil {
 			u.mu.Lock()
-			u.cache = c
-			u.mu.Unlock()
-			_ = SaveServerCache(c)
+			if u.cfg.SpecHash() == c.SpecHash {
+				u.cache = c
+				u.mu.Unlock()
+				_ = SaveServerCache(c)
+			} else {
+				u.mu.Unlock()
+			}
 		}
 	}
 
 	u.mu.Lock()
-	if u.proc == bp && u.status == "starting" {
+	if u.proc == bp && u.status == "starting" && !bp.isStopping() {
 		u.status = "running"
 		u.lastUsedAt = time.Now()
 		u.resetIdleTimerLocked()
 		if u.logger != nil {
-			u.logger.Printf("準備完了 %s（PID %d, %s）", u.name, bp.pid, time.Since(u.startedAt).Round(10*time.Millisecond))
+			u.logger.Printf("準備完了 %s（PID %d, %s）", u.name, pid, time.Since(u.startedAt).Round(10*time.Millisecond))
 		}
 	}
 	u.mu.Unlock()
 
+	if bp.isStopping() {
+		finish(errors.New("起動中に停止されました"))
+		return
+	}
 	finish(nil)
 }
 
@@ -469,8 +542,11 @@ func (u *MCPUnit) readStdout(bp *backendProc, r io.Reader) {
 func (u *MCPUnit) handleBackendLine(bp *backendProc, line []byte) {
 	var msg RPCMessage
 	if err := json.Unmarshal(line, &msg); err != nil {
-		if bp.logFile != nil {
-			_, _ = fmt.Fprintf(bp.logFile, "[stdout] %s\n", string(line))
+		bp.procMu.Lock()
+		lf := bp.logFile
+		bp.procMu.Unlock()
+		if lf != nil {
+			_, _ = fmt.Fprintf(lf, "[stdout] %s\n", string(line))
 		}
 		return
 	}
@@ -499,9 +575,13 @@ func (u *MCPUnit) handleBackendLine(bp *backendProc, line []byte) {
 				defer cancel()
 				if c, err := u.fetchMetadataFromProc(ctx, bp); err == nil {
 					u.mu.Lock()
-					u.cache = c
-					u.mu.Unlock()
-					_ = SaveServerCache(c)
+					if u.cfg.SpecHash() == c.SpecHash {
+						u.cache = c
+						u.mu.Unlock()
+						_ = SaveServerCache(c)
+					} else {
+						u.mu.Unlock()
+					}
 				}
 			}()
 		}
@@ -527,8 +607,15 @@ func (u *MCPUnit) handleBackendLine(bp *backendProc, line []byte) {
 }
 
 func (u *MCPUnit) fetchMetadataFromProc(ctx context.Context, bp *backendProc) (*ServerCache, error) {
+	specHash := bp.specHash
+	if specHash == "" {
+		u.mu.Lock()
+		specHash = u.cfg.SpecHash()
+		u.mu.Unlock()
+	}
 	cache := &ServerCache{
 		ServerName:       u.name,
+		SpecHash:         specHash,
 		UpdatedAt:        time.Now(),
 		InitializeResult: bp.initRaw,
 		Tools:            []json.RawMessage{},
@@ -600,7 +687,8 @@ func (u *MCPUnit) fetchMetadataFromProc(ctx context.Context, bp *backendProc) (*
 
 func (u *MCPUnit) EnsureCache(ctx context.Context, forceRefresh bool) (*ServerCache, error) {
 	u.mu.Lock()
-	if !forceRefresh && u.cache != nil {
+	wantSpec := u.cfg.SpecHash()
+	if !forceRefresh && u.cache != nil && u.cache.SpecHash == wantSpec {
 		c := u.cache
 		u.mu.Unlock()
 		return c, nil
@@ -614,7 +702,8 @@ func (u *MCPUnit) EnsureCache(ctx context.Context, forceRefresh bool) (*ServerCa
 	}
 
 	u.mu.Lock()
-	missingCache := u.cache == nil
+	wantSpec = u.cfg.SpecHash()
+	missingCache := u.cache == nil || u.cache.SpecHash != wantSpec
 	u.mu.Unlock()
 
 	if forceRefresh || missingCache {
@@ -775,7 +864,8 @@ func (u *MCPUnit) handleHeavyRequest(ctx context.Context, msg RPCMessage) ([]byt
 			}
 			u.disconnectTimer = time.AfterFunc(DisconnectGrace, func() {
 				u.mu.Lock()
-				stillIdle := u.activeClients == 0 && u.inFlight == 0 && u.status == "running" && !u.shuttingDown
+				stillIdle := u.activeClients == 0 && u.inFlight == 0 &&
+					(u.status == "running" || u.status == "starting") && !u.shuttingDown
 				u.mu.Unlock()
 				if stillIdle {
 					_ = u.Stop("全クライアント切断", true)
@@ -831,8 +921,17 @@ func (u *MCPUnit) onProcessExited(bp *backendProc, waitErr error) {
 }
 
 func (u *MCPUnit) markFailed(bp *backendProc, reason string) {
+	if bp.isStopping() {
+		return
+	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if u.status == "stopping" || u.status == "stopped" || u.status == "idle" {
+		if u.proc == bp {
+			u.proc = nil
+		}
+		return
+	}
 	if u.proc == bp {
 		u.proc = nil
 	}
@@ -873,16 +972,22 @@ func (u *MCPUnit) Stop(reason string, toIdle bool) error {
 	u.status = "stopping"
 	u.mu.Unlock()
 
-	_ = bp.stdin.Close()
-	if bp.pid > 0 {
-		_ = syscall.Kill(-bp.pid, syscall.SIGTERM)
+	stdin, pid := bp.requestStop()
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if pid > 0 {
+		_ = syscall.Kill(-pid, syscall.SIGTERM)
 	}
 
 	select {
 	case <-bp.exited:
 	case <-time.After(StopGrace):
-		if bp.pid > 0 {
-			_ = syscall.Kill(-bp.pid, syscall.SIGKILL)
+		bp.procMu.Lock()
+		killPid := bp.pid
+		bp.procMu.Unlock()
+		if killPid > 0 {
+			_ = syscall.Kill(-killPid, syscall.SIGKILL)
 		}
 		<-bp.exited
 	}
@@ -949,7 +1054,9 @@ func (u *MCPUnit) Snapshot() UnitStatus {
 
 	pid := 0
 	if u.proc != nil {
+		u.proc.procMu.Lock()
 		pid = u.proc.pid
+		u.proc.procMu.Unlock()
 	}
 	started := ""
 	if !u.startedAt.IsZero() {

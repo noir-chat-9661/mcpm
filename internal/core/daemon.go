@@ -34,15 +34,18 @@ type ControlRequest struct {
 }
 
 type Daemon struct {
-	mu           sync.Mutex
-	cfg          *Config
-	units        map[string]*MCPUnit
-	listeners    map[string][]net.Listener
-	gatewayLn    []net.Listener
-	logger       *log.Logger
-	events       *EventLog
-	shutdownFn   func()
-	shuttingDown bool
+	mu            sync.Mutex
+	cfg           *Config
+	units         map[string]*MCPUnit
+	listeners     map[string][]net.Listener
+	httpServers   map[string][]*http.Server
+	listenerPorts map[string]int
+	gatewayLn     []net.Listener
+	gatewaySrvs   []*http.Server
+	logger        *log.Logger
+	events        *EventLog
+	shutdownFn    func()
+	shuttingDown  bool
 
 	sseMu       sync.Mutex
 	sseSeq      atomic.Uint64
@@ -51,12 +54,14 @@ type Daemon struct {
 
 func NewDaemon(cfg *Config, logger *log.Logger) *Daemon {
 	d := &Daemon{
-		cfg:         cfg,
-		units:       map[string]*MCPUnit{},
-		listeners:   map[string][]net.Listener{},
-		logger:      logger,
-		events:      &EventLog{},
-		sseSessions: map[string]chan []byte{},
+		cfg:           cfg,
+		units:         map[string]*MCPUnit{},
+		listeners:     map[string][]net.Listener{},
+		httpServers:   map[string][]*http.Server{},
+		listenerPorts: map[string]int{},
+		logger:        logger,
+		events:        &EventLog{},
+		sseSessions:   map[string]chan []byte{},
 	}
 	for _, name := range cfg.SortedServerNames() {
 		sc := cfg.Servers[name]
@@ -179,36 +184,72 @@ func RunDaemon(cfg *Config, warm []string) error {
 	return nil
 }
 
+func (d *Daemon) closeUnitListenersLocked(name string) {
+	for _, srv := range d.httpServers[name] {
+		_ = srv.Close()
+	}
+	for _, l := range d.listeners[name] {
+		_ = l.Close()
+	}
+	delete(d.httpServers, name)
+	delete(d.listeners, name)
+	delete(d.listenerPorts, name)
+}
+
 func (d *Daemon) BindServerPorts() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	for name := range d.listeners {
+		u, ok := d.units[name]
+		port := 0
+		if ok {
+			u.mu.Lock()
+			port = u.cfg.Port
+			u.mu.Unlock()
+		}
+		if !ok || port <= 0 || d.listenerPorts[name] != port {
+			d.closeUnitListenersLocked(name)
+		}
+	}
+
 	for name, u := range d.units {
-		if u.cfg.Port <= 0 {
+		u.mu.Lock()
+		port := u.cfg.Port
+		u.mu.Unlock()
+		if port <= 0 {
 			continue
 		}
-		if len(d.listeners[name]) > 0 {
+		if len(d.listeners[name]) > 0 && d.listenerPorts[name] == port {
 			continue
 		}
 		var lns []net.Listener
+		var srvs []*http.Server
 		for _, host := range []string{"127.0.0.1", "::1"} {
-			l, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(u.cfg.Port)))
+			l, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 			if err != nil {
 				if host == "::1" && errors.Is(err, syscall.EADDRNOTAVAIL) {
 					continue
+				}
+				for _, prevSrv := range srvs {
+					_ = prevSrv.Close()
 				}
 				for _, prev := range lns {
 					_ = prev.Close()
 				}
 				if errors.Is(err, syscall.EADDRINUSE) {
-					return fmt.Errorf("ポート %d（%s）が既に使用されています", u.cfg.Port, name)
+					return fmt.Errorf("ポート %d（%s）が既に使用されています", port, name)
 				}
 				return err
 			}
 			lns = append(lns, l)
 			srv := &http.Server{Handler: d.UnitHTTPHandler(u)}
+			srvs = append(srvs, srv)
 			go srv.Serve(l)
 		}
 		d.listeners[name] = lns
+		d.httpServers[name] = srvs
+		d.listenerPorts[name] = port
 	}
 	return nil
 }
@@ -216,11 +257,8 @@ func (d *Daemon) BindServerPorts() error {
 func (d *Daemon) CloseListeners() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for name, lns := range d.listeners {
-		for _, l := range lns {
-			_ = l.Close()
-		}
-		delete(d.listeners, name)
+	for name := range d.listeners {
+		d.closeUnitListenersLocked(name)
 	}
 	for _, l := range d.gatewayLn {
 		_ = l.Close()
@@ -324,15 +362,24 @@ func (d *Daemon) reloadConfig() error {
 	d.mu.Lock()
 	d.cfg = cfg
 	seen := map[string]bool{}
+	var specChanged []*MCPUnit
 	for _, name := range cfg.SortedServerNames() {
 		seen[name] = true
 		sc := cfg.Servers[name]
 		if existing, ok := d.units[name]; ok {
 			existing.mu.Lock()
+			changed := existing.cfg.SpecHash() != sc.SpecHash()
 			existing.cfg = sc
 			existing.globalIdle = cfg.IdleTimeout
+			if changed {
+				existing.cache = nil
+				specChanged = append(specChanged, existing)
+			}
 			existing.resetIdleTimerLocked()
 			existing.mu.Unlock()
+			if changed {
+				_ = RemoveServerCache(name)
+			}
 		} else {
 			d.units[name] = NewMCPUnit(name, sc, cfg.IdleTimeout, d.logger)
 		}
@@ -342,18 +389,20 @@ func (d *Daemon) reloadConfig() error {
 		if !seen[name] {
 			removed = append(removed, u)
 			delete(d.units, name)
-			for _, l := range d.listeners[name] {
-				_ = l.Close()
-			}
-			delete(d.listeners, name)
+			d.closeUnitListenersLocked(name)
 		}
 	}
 	d.mu.Unlock()
 
+	for _, u := range specChanged {
+		_ = u.Stop("設定変更により再起動待機", true)
+	}
 	for _, u := range removed {
 		_ = u.Stop("設定から削除", true)
 	}
-	_ = d.BindServerPorts()
+	if err := d.BindServerPorts(); err != nil {
+		return err
+	}
 	if d.logger != nil {
 		d.logger.Printf("設定を再読み込みしました（%d 個の MCP サーバー）", len(seen))
 	}

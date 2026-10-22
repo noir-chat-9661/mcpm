@@ -62,6 +62,24 @@ func (s ServerConfig) ShouldCloseOnDisconnect() bool {
 	return *s.CloseOnDisconnect
 }
 
+// SpecHash はスキーマやプロセス実体に影響する設定（Command, Args, Env, Cwd）のハッシュ値を返す。
+func (s ServerConfig) SpecHash() string {
+	type spec struct {
+		Command string            `json:"command"`
+		Args    []string          `json:"args,omitempty"`
+		Env     map[string]string `json:"env,omitempty"`
+		Cwd     string            `json:"cwd,omitempty"`
+	}
+	b, _ := json.Marshal(spec{
+		Command: s.Command,
+		Args:    s.Args,
+		Env:     s.Env,
+		Cwd:     s.Cwd,
+	})
+	sum := sha256.Sum256(b)
+	return fmt.Sprintf("%x", sum[:16])
+}
+
 func HomeDir() string {
 	if v := os.Getenv("MCPM_HOME"); v != "" {
 		return v

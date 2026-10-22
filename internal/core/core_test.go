@@ -33,6 +33,11 @@ func TestHelperMCPServer(t *testing.T) {
 		}
 		switch msg.Method {
 		case "initialize":
+			if dStr := os.Getenv("HELPER_INIT_DELAY_MS"); dStr != "" {
+				if ms, err := strconv.Atoi(dStr); err == nil && ms > 0 {
+					time.Sleep(time.Duration(ms) * time.Millisecond)
+				}
+			}
 			res, _ := MakeRPCResult(msg.ID, map[string]any{
 				"protocolVersion": "2024-11-05",
 				"capabilities": map[string]any{
@@ -45,10 +50,14 @@ func TestHelperMCPServer(t *testing.T) {
 			})
 			_, _ = os.Stdout.Write(append(res, '\n'))
 		case "tools/list":
+			toolName := os.Getenv("HELPER_TOOL_NAME")
+			if toolName == "" {
+				toolName = "echo_pid"
+			}
 			res, _ := MakeRPCResult(msg.ID, map[string]any{
 				"tools": []map[string]any{
 					{
-						"name":        "echo_pid",
+						"name":        toolName,
 						"description": "Returns backend PID and echoed text",
 						"inputSchema": map[string]any{"type": "object"},
 					},
@@ -337,4 +346,129 @@ func TestUDSConnectAndAutoCloseOnDisconnect(t *testing.T) {
 	}
 	st := d.ResolveUnit("uds-mock").Snapshot()
 	t.Fatalf("全クライアント切断後に自動 close されるべきですが status=%s pid=%d clients=%d でした", st.Status, st.Pid, st.ActiveClients)
+}
+
+func TestStopDuringStartingNoPanic(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("MCPM_HOME", tmp)
+	if err := EnsureHomeDir(); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := log.New(io.Discard, "", 0)
+	sc := newTestServerConfig(t, "5m")
+	sc.Env["HELPER_INIT_DELAY_MS"] = "250"
+	u := NewMCPUnit("race-stop", sc, "5m", logger)
+
+	// 1. 子プロセス準備前〜initialize 応答待ちの各タイミングで Stop を競合させても panic しないこと
+	for range 10 {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_, _ = u.EnsureRunning(ctx, "race start", true)
+		}()
+
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if u.Snapshot().Status == "starting" {
+				break
+			}
+			time.Sleep(100 * time.Microsecond)
+		}
+
+		if err := u.Stop("起動直後の手動 close", true); err != nil {
+			t.Fatalf("Stop during starting failed: %v", err)
+		}
+		<-done
+
+		st := u.Snapshot()
+		if st.Status != "idle" || st.Pid != 0 {
+			t.Fatalf("Stop 後は idle (PID 0) であるべきですが status=%s pid=%d でした", st.Status, st.Pid)
+		}
+	}
+}
+
+func TestReloadPortRebindAndSchemaCacheInvalidation(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("MCPM_HOME", tmp)
+	if err := EnsureHomeDir(); err != nil {
+		t.Fatal(err)
+	}
+
+	allocPort := func() int {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := l.Addr().(*net.TCPAddr).Port
+		_ = l.Close()
+		return p
+	}
+	port1 := allocPort()
+	port2 := allocPort()
+
+	sc := newTestServerConfig(t, "5m")
+	sc.Port = port1
+	sc.Env["HELPER_TOOL_NAME"] = "tool_v1"
+
+	cfg := &Config{
+		GatewayPort: 0,
+		Servers: map[string]ServerConfig{
+			"rebind-mock": sc,
+		},
+	}
+	if err := SaveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := log.New(io.Discard, "", 0)
+	d := NewDaemon(cfg, logger)
+	if err := d.BindServerPorts(); err != nil {
+		t.Fatal(err)
+	}
+	defer d.CloseListeners()
+	defer func() { _ = d.ResolveUnit("rebind-mock").Stop("test end", true) }()
+
+	url1 := "http://127.0.0.1:" + strconv.Itoa(port1) + "/mcp"
+	url2 := "http://127.0.0.1:" + strconv.Itoa(port2) + "/mcp"
+
+	res1, err := http.Post(url1, "application/json", bytes.NewBufferString(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	if err != nil {
+		t.Fatalf("initial port1 request failed: %v", err)
+	}
+	body1, _ := io.ReadAll(res1.Body)
+	_ = res1.Body.Close()
+	if !bytes.Contains(body1, []byte(`"tool_v1"`)) {
+		t.Fatalf("expected tool_v1 on port1, got: %s", string(body1))
+	}
+
+	// ポート変更 (port1 -> port2) かつコマンド環境変更 (tool_v1 -> tool_v2) して reload
+	sc2 := newTestServerConfig(t, "5m")
+	sc2.Port = port2
+	sc2.Env["HELPER_TOOL_NAME"] = "tool_v2"
+	cfg.Servers["rebind-mock"] = sc2
+	if err := SaveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Act("reload", "", ""); err != nil {
+		t.Fatalf("reload failed: %v", err)
+	}
+
+	// 旧ポート (port1) は閉じられていること
+	if _, err := http.Post(url1, "application/json", bytes.NewBufferString(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)); err == nil {
+		t.Fatalf("old port %d should be closed after reload, but request succeeded", port1)
+	}
+
+	// 新ポート (port2) で待ち受けられ、かつ新しいスキーマ (tool_v2) が返ること
+	res2, err := http.Post(url2, "application/json", bytes.NewBufferString(`{"jsonrpc":"2.0","id":3,"method":"tools/list"}`))
+	if err != nil {
+		t.Fatalf("new port2 request failed: %v", err)
+	}
+	body2, _ := io.ReadAll(res2.Body)
+	_ = res2.Body.Close()
+	if !bytes.Contains(body2, []byte(`"tool_v2"`)) || bytes.Contains(body2, []byte(`"tool_v1"`)) {
+		t.Fatalf("expected updated schema tool_v2 on port2, got: %s", string(body2))
+	}
 }

@@ -61,6 +61,7 @@ func MakeRPCError(id json.RawMessage, code int, message string) ([]byte, error) 
 
 type ServerCache struct {
 	ServerName        string            `json:"serverName"`
+	SpecHash          string            `json:"specHash,omitempty"`
 	UpdatedAt         time.Time         `json:"updatedAt"`
 	InitializeResult  json.RawMessage   `json:"initializeResult"`
 	Tools             []json.RawMessage `json:"tools"`
@@ -71,6 +72,14 @@ type ServerCache struct {
 
 func ServerCachePath(name string) string {
 	return filepath.Join(CacheDir(), name+".json")
+}
+
+func RemoveServerCache(name string) error {
+	err := os.Remove(ServerCachePath(name))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 
 func LoadServerCache(name string) (*ServerCache, error) {
