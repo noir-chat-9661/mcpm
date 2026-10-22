@@ -10,8 +10,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -20,12 +22,26 @@ func TestHelperMCPServer(t *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_MCP") != "1" {
 		return
 	}
+	if dStr := os.Getenv("HELPER_EXIT_DELAY_MS"); dStr != "" {
+		if ms, err := strconv.Atoi(dStr); err == nil && ms > 0 {
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, syscall.SIGTERM)
+			go func() {
+				<-sigCh
+				time.Sleep(time.Duration(ms) * time.Millisecond)
+				os.Exit(0)
+			}()
+		}
+	}
 	pid := os.Getpid()
 	dec := json.NewDecoder(os.Stdin)
 
 	for {
 		var msg RPCMessage
 		if err := dec.Decode(&msg); err != nil {
+			if os.Getenv("HELPER_EXIT_DELAY_MS") != "" {
+				time.Sleep(5 * time.Second)
+			}
 			os.Exit(0)
 		}
 		if msg.IsNotification() {
@@ -471,4 +487,96 @@ func TestReloadPortRebindAndSchemaCacheInvalidation(t *testing.T) {
 	if !bytes.Contains(body2, []byte(`"tool_v2"`)) || bytes.Contains(body2, []byte(`"tool_v1"`)) {
 		t.Fatalf("expected updated schema tool_v2 on port2, got: %s", string(body2))
 	}
+}
+
+func TestLegacyHashlessCacheIsDiscarded(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("MCPM_HOME", tmp)
+	if err := EnsureHomeDir(); err != nil {
+		t.Fatal(err)
+	}
+
+	// SpecHash のない旧形式キャッシュを事前に保存
+	legacyCache := &ServerCache{
+		ServerName:       "legacy-unit",
+		SpecHash:         "",
+		UpdatedAt:        time.Now(),
+		InitializeResult: json.RawMessage(`{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"old","version":"0.0.1"}}`),
+		Tools:            []json.RawMessage{json.RawMessage(`{"name":"stale_legacy_tool"}`)},
+	}
+	if err := SaveServerCache(legacyCache); err != nil {
+		t.Fatal(err)
+	}
+
+	sc := newTestServerConfig(t, "5m")
+	sc.Env["HELPER_TOOL_NAME"] = "fresh_tool"
+	logger := log.New(io.Discard, "", 0)
+	u := NewMCPUnit("legacy-unit", sc, "5m", logger)
+
+	if u.Snapshot().Cached {
+		t.Fatalf("specHash のない旧版キャッシュは破棄されるべきですが Cached=true でした")
+	}
+
+	respBytes, err := u.HandleMessage(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	if err != nil {
+		t.Fatalf("tools/list error: %v", err)
+	}
+	if !bytes.Contains(respBytes, []byte(`"fresh_tool"`)) || bytes.Contains(respBytes, []byte(`"stale_legacy_tool"`)) {
+		t.Fatalf("最新のツール (fresh_tool) が返るべきですが got: %s", string(respBytes))
+	}
+}
+
+func TestEnsureRunningWaitsForInProgressStop(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("MCPM_HOME", tmp)
+	if err := EnsureHomeDir(); err != nil {
+		t.Fatal(err)
+	}
+
+	sc := newTestServerConfig(t, "5m")
+	sc.Env["HELPER_EXIT_DELAY_MS"] = "150"
+	logger := log.New(io.Discard, "", 0)
+	u := NewMCPUnit("stopping-sync", sc, "5m", logger)
+	ctx := context.Background()
+
+	// 1. まず起動して PID を取得
+	bp1, err := u.EnsureRunning(ctx, "initial", true)
+	if err != nil {
+		t.Fatalf("initial EnsureRunning failed: %v", err)
+	}
+	oldPid := bp1.pid
+
+	// 2. 非同期で Stop を開始し、stopping 状態に入るのを待つ
+	stopFinished := make(chan error, 1)
+	go func() {
+		stopFinished <- u.Stop("slow stop", true)
+	}()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if u.Snapshot().Status == "stopping" {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	if st := u.Snapshot().Status; st != "stopping" {
+		t.Fatalf("expected unit to enter stopping state, got %s", st)
+	}
+
+	// 3. stopping 中に新しい呼び出し (tools/call) を行う
+	callResp, err := u.HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"echo_pid","arguments":{"text":"after-stop"}}}`))
+	if err != nil {
+		t.Fatalf("HandleMessage during stopping failed: %v", err)
+	}
+	if err := <-stopFinished; err != nil {
+		t.Fatalf("Stop returned error: %v", err)
+	}
+
+	// 4. 新しいプロセスで処理され、Stop 完了後も状態が idle に上書きされず running であること
+	st := u.Snapshot()
+	if st.Status != "running" || st.Pid == 0 || st.Pid == oldPid {
+		t.Fatalf("stopping 中の再起動後は新 PID で running であるべきですが status=%s oldPid=%d newPid=%d (resp=%s) でした",
+			st.Status, oldPid, st.Pid, string(callResp))
+	}
+	_ = u.Stop("cleanup", true)
 }

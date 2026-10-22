@@ -186,6 +186,7 @@ type MCPUnit struct {
 	totalCalls      int
 	idleTimer       *time.Timer
 	disconnectTimer *time.Timer
+	stopDone        chan struct{}
 	shuttingDown    bool
 
 	subMu       sync.Mutex
@@ -203,9 +204,10 @@ func NewMCPUnit(name string, cfg ServerConfig, globalIdle string, logger *log.Lo
 		subscribers: map[uint64]chan []byte{},
 	}
 	if c, err := LoadServerCache(name); err == nil {
-		if c.SpecHash == "" || c.SpecHash == cfg.SpecHash() {
-			c.SpecHash = cfg.SpecHash()
+		if c.SpecHash != "" && c.SpecHash == cfg.SpecHash() {
 			u.cache = c
+		} else {
+			_ = RemoveServerCache(name)
 		}
 	}
 	return u
@@ -296,35 +298,48 @@ func (u *MCPUnit) resetIdleTimerLocked() {
 }
 
 func (u *MCPUnit) EnsureRunning(ctx context.Context, reason string, manual bool) (*backendProc, error) {
-	u.mu.Lock()
-	if u.shuttingDown {
-		u.mu.Unlock()
-		return nil, errors.New("mcpmd は終了処理中です")
-	}
-	if u.status == "running" && u.proc != nil {
-		bp := u.proc
-		u.lastUsedAt = time.Now()
-		u.resetIdleTimerLocked()
-		u.mu.Unlock()
-		return bp, nil
-	}
-	if u.status == "starting" && u.proc != nil && u.proc.readyRes != nil {
-		bp := u.proc
-		res := bp.readyRes
-		u.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-res.done:
-			if res.err != nil {
-				return nil, res.err
+	for {
+		u.mu.Lock()
+		if u.shuttingDown {
+			u.mu.Unlock()
+			return nil, errors.New("mcpmd は終了処理中です")
+		}
+		if u.status == "stopping" && u.stopDone != nil {
+			waitStop := u.stopDone
+			u.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-waitStop:
 			}
+			continue
+		}
+		if u.status == "running" && u.proc != nil {
+			bp := u.proc
+			u.lastUsedAt = time.Now()
+			u.resetIdleTimerLocked()
+			u.mu.Unlock()
 			return bp, nil
 		}
-	}
-	if !manual && u.status == "failed" && time.Since(u.failedAt) < FailBackoff {
-		u.mu.Unlock()
-		return nil, fmt.Errorf("%s は直前の起動に失敗しています（mcpm logs %s を確認してください）", u.name, u.name)
+		if u.status == "starting" && u.proc != nil && u.proc.readyRes != nil {
+			bp := u.proc
+			res := bp.readyRes
+			u.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-res.done:
+				if res.err != nil {
+					return nil, res.err
+				}
+				return bp, nil
+			}
+		}
+		if !manual && u.status == "failed" && time.Since(u.failedAt) < FailBackoff {
+			u.mu.Unlock()
+			return nil, fmt.Errorf("%s は直前の起動に失敗しています（mcpm logs %s を確認してください）", u.name, u.name)
+		}
+		break
 	}
 
 	initCtx, cancelInit := context.WithTimeout(context.Background(), ReadyTimeout)
@@ -970,6 +985,8 @@ func (u *MCPUnit) Stop(reason string, toIdle bool) error {
 		return nil
 	}
 	u.status = "stopping"
+	stopDone := make(chan struct{})
+	u.stopDone = stopDone
 	u.mu.Unlock()
 
 	stdin, pid := bp.requestStop()
@@ -1005,6 +1022,10 @@ func (u *MCPUnit) Stop(reason string, toIdle bool) error {
 		u.reason = reason
 	}
 	u.startedAt = time.Time{}
+	if u.stopDone == stopDone {
+		u.stopDone = nil
+	}
+	close(stopDone)
 	u.mu.Unlock()
 
 	if u.logger != nil {
