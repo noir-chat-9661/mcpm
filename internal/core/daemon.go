@@ -396,6 +396,7 @@ func (d *Daemon) reloadConfig() error {
 
 	for _, u := range specChanged {
 		_ = u.Stop("設定変更により再起動待機", true)
+		u.broadcastNotification([]byte(`{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`))
 	}
 	for _, u := range removed {
 		_ = u.Stop("設定から削除", true)

@@ -923,6 +923,15 @@ func (u *MCPUnit) onProcessExited(bp *backendProc, waitErr error) {
 	if u.status == "stopping" || u.status == "stopped" || u.status == "idle" {
 		return
 	}
+	if waitErr == nil && u.status == "running" && u.inFlight == 0 {
+		u.status = "idle"
+		u.startedAt = time.Time{}
+		u.reason = "プロセス終了 (exit 0)"
+		if u.logger != nil {
+			u.logger.Printf("終了 %s（exit 0）", u.name)
+		}
+		return
+	}
 	code := "exit 0"
 	if waitErr != nil {
 		code = waitErr.Error()

@@ -72,7 +72,7 @@ func spawnDetachedDaemon(warm []string) error {
 		args = append(args, "--warm", strings.Join(warm, ","))
 	}
 	cmd := exec.Command(daemonBin, args...)
-	cmd.Stdout = lf
+	cmd.Stdout = nil
 	cmd.Stderr = lf
 	cmd.Stdin = nil
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
