@@ -580,3 +580,62 @@ func TestEnsureRunningWaitsForInProgressStop(t *testing.T) {
 	}
 	_ = u.Stop("cleanup", true)
 }
+
+func TestUnifiedEndpointAggregatesAndRoutesOnDemand(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("MCPM_HOME", tmp)
+	if err := EnsureHomeDir(); err != nil {
+		t.Fatal(err)
+	}
+
+	scA := newTestServerConfig(t, "5m")
+	scA.Env["HELPER_TOOL_NAME"] = "alpha_tool"
+	scB := newTestServerConfig(t, "5m")
+	scB.Env["HELPER_TOOL_NAME"] = "beta_tool"
+
+	cfg := &Config{
+		GatewayPort: 0,
+		Servers: map[string]ServerConfig{
+			"unit-a": scA,
+			"unit-b": scB,
+		},
+	}
+	logger := log.New(io.Discard, "", 0)
+	d := NewDaemon(cfg, logger)
+	defer func() {
+		_ = d.ResolveUnit("unit-a").Stop("cleanup", true)
+		_ = d.ResolveUnit("unit-b").Stop("cleanup", true)
+	}()
+
+	ep := d.UnifiedEndpoint()
+	ctx := context.Background()
+
+	// 1. 統括 tools/list: 全ユニットのツールが統合されて返り、プロセスは両方とも idle (PID 0) に戻ること
+	listResp, err := ep.HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+	if err != nil {
+		t.Fatalf("unified tools/list failed: %v", err)
+	}
+	if !bytes.Contains(listResp, []byte(`"alpha_tool"`)) || !bytes.Contains(listResp, []byte(`"beta_tool"`)) {
+		t.Fatalf("expected both alpha_tool and beta_tool in unified tools/list, got: %s", string(listResp))
+	}
+	if stA, stB := d.ResolveUnit("unit-a").Snapshot(), d.ResolveUnit("unit-b").Snapshot(); stA.Pid != 0 || stB.Pid != 0 {
+		t.Fatalf("tools/list 後は両方とも idle (PID 0) であるべきですが unit-a=%d unit-b=%d でした", stA.Pid, stB.Pid)
+	}
+
+	// 2. alpha_tool を呼び出すと unit-a だけが起動し、unit-b は idle (PID 0) のままであること
+	callA, err := ep.HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"alpha_tool","arguments":{"text":"from-a"}}}`))
+	if err != nil {
+		t.Fatalf("unified tools/call alpha_tool failed: %v", err)
+	}
+	if !bytes.Contains(callA, []byte(`"from-a"`)) {
+		t.Fatalf("unexpected alpha_tool call response: %s", string(callA))
+	}
+	stA := d.ResolveUnit("unit-a").Snapshot()
+	stB := d.ResolveUnit("unit-b").Snapshot()
+	if stA.Status != "running" || stA.Pid == 0 {
+		t.Fatalf("unit-a should be running after alpha_tool call, got status=%s pid=%d", stA.Status, stA.Pid)
+	}
+	if stB.Status != "idle" || stB.Pid != 0 {
+		t.Fatalf("unit-b should remain idle (PID 0) when only alpha_tool is called, got status=%s pid=%d", stB.Status, stB.Pid)
+	}
+}

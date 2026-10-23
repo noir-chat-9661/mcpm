@@ -451,11 +451,17 @@ func (d *Daemon) ControlHandler() http.Handler {
 	})
 
 	mux.HandleFunc("POST /connect", func(w http.ResponseWriter, r *http.Request) {
-		name := r.URL.Query().Get("name")
-		u := d.ResolveUnit(name)
-		if u == nil {
-			writeErr(w, fmt.Errorf("MCP サーバー %q が登録されていません（`mcpm add` で登録してください）", name))
-			return
+		name := strings.TrimSpace(r.URL.Query().Get("name"))
+		var ep MessageEndpoint
+		if name == "" || name == "all" || name == "*" || name == "_all" {
+			ep = d.UnifiedEndpoint()
+		} else {
+			u := d.ResolveUnit(name)
+			if u == nil {
+				writeErr(w, fmt.Errorf("MCP サーバー %q が登録されていません（`mcpm add` で登録してください）", name))
+				return
+			}
+			ep = u
 		}
 		hj, ok := w.(http.Hijacker)
 		if !ok {
@@ -471,14 +477,14 @@ func (d *Daemon) ControlHandler() http.Handler {
 		_, _ = bufrw.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\r\n")
 		_ = bufrw.Flush()
 
-		d.serveRawStream(u, bufrw.Reader, conn)
+		d.serveRawStream(ep, bufrw.Reader, conn)
 	})
 
 	return mux
 }
 
-func (d *Daemon) serveRawStream(u *MCPUnit, r *bufio.Reader, w io.Writer) {
-	_, notifCh, unsubscribe := u.Subscribe()
+func (d *Daemon) serveRawStream(ep MessageEndpoint, r *bufio.Reader, w io.Writer) {
+	_, notifCh, unsubscribe := ep.Subscribe()
 	defer unsubscribe()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -519,7 +525,7 @@ func (d *Daemon) serveRawStream(u *MCPUnit, r *bufio.Reader, w io.Writer) {
 				reqWg.Add(1)
 				go func(raw []byte) {
 					defer reqWg.Done()
-					resp, hErr := u.HandleMessage(ctx, raw)
+					resp, hErr := ep.HandleMessage(ctx, raw)
 					if hErr == nil && len(resp) > 0 {
 						_ = sendLine(resp)
 					}
@@ -536,25 +542,46 @@ func (d *Daemon) serveRawStream(u *MCPUnit, r *bufio.Reader, w io.Writer) {
 
 func (d *Daemon) GatewayHTTPHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, "/")
+		path := strings.Trim(r.URL.Path, "/")
+		if path == "" || path == "mcp" {
+			d.serveStreamableHTTP(d.UnifiedEndpoint(), w, r)
+			return
+		}
+		if path == "sse" {
+			d.serveSSE(d.UnifiedEndpoint(), "/message", w, r)
+			return
+		}
+		if path == "message" {
+			d.serveSSEMessage(d.UnifiedEndpoint(), w, r)
+			return
+		}
+
 		parts := strings.SplitN(path, "/", 3)
 		if len(parts) < 2 {
-			http.Error(w, "usage: /mcp/<server-name> or /sse/<server-name>", http.StatusNotFound)
+			http.Error(w, "usage: /mcp, /mcp/<server-name>, /sse, or /sse/<server-name>", http.StatusNotFound)
 			return
 		}
 		prefix, name := parts[0], parts[1]
-		u := d.ResolveUnit(name)
-		if u == nil {
-			http.Error(w, fmt.Sprintf("unknown MCP server %q", name), http.StatusNotFound)
-			return
+		var ep MessageEndpoint
+		msgPath := "/message/" + name
+		if name == "all" || name == "*" || name == "_all" {
+			ep = d.UnifiedEndpoint()
+		} else {
+			u := d.ResolveUnit(name)
+			if u == nil {
+				http.Error(w, fmt.Sprintf("unknown MCP server %q", name), http.StatusNotFound)
+				return
+			}
+			ep = u
+			msgPath = "/message/" + u.name
 		}
 		switch prefix {
 		case "mcp":
-			d.serveStreamableHTTP(u, w, r)
+			d.serveStreamableHTTP(ep, w, r)
 		case "sse":
-			d.serveSSE(u, "/message/"+u.name, w, r)
+			d.serveSSE(ep, msgPath, w, r)
 		case "message":
-			d.serveSSEMessage(u, w, r)
+			d.serveSSEMessage(ep, w, r)
 		default:
 			http.Error(w, "not found", http.StatusNotFound)
 		}
@@ -574,7 +601,7 @@ func (d *Daemon) UnitHTTPHandler(u *MCPUnit) http.Handler {
 	})
 }
 
-func (d *Daemon) serveStreamableHTTP(u *MCPUnit, w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) serveStreamableHTTP(ep MessageEndpoint, w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodDelete:
 		w.WriteHeader(http.StatusOK)
@@ -585,7 +612,7 @@ func (d *Daemon) serveStreamableHTTP(u *MCPUnit, w http.ResponseWriter, r *http.
 			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 			return
 		}
-		_, notifCh, unsubscribe := u.Subscribe()
+		_, notifCh, unsubscribe := ep.Subscribe()
 		defer unsubscribe()
 
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -617,7 +644,7 @@ func (d *Daemon) serveStreamableHTTP(u *MCPUnit, w http.ResponseWriter, r *http.
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
-		resp, err := u.HandleMessage(r.Context(), trimmed)
+		resp, err := ep.HandleMessage(r.Context(), trimmed)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -634,13 +661,13 @@ func (d *Daemon) serveStreamableHTTP(u *MCPUnit, w http.ResponseWriter, r *http.
 	}
 }
 
-func (d *Daemon) serveSSE(u *MCPUnit, msgPath string, w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) serveSSE(ep MessageEndpoint, msgPath string, w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
-	_, notifCh, unsubscribe := u.Subscribe()
+	_, notifCh, unsubscribe := ep.Subscribe()
 	defer unsubscribe()
 
 	sessID := strconv.FormatUint(d.sseSeq.Add(1), 10)
@@ -678,7 +705,7 @@ func (d *Daemon) serveSSE(u *MCPUnit, msgPath string, w http.ResponseWriter, r *
 	}
 }
 
-func (d *Daemon) serveSSEMessage(u *MCPUnit, w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) serveSSEMessage(ep MessageEndpoint, w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -698,7 +725,7 @@ func (d *Daemon) serveSSEMessage(u *MCPUnit, w http.ResponseWriter, r *http.Requ
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), ReadyTimeout*2)
 		defer cancel()
-		resp, hErr := u.HandleMessage(ctx, bytes.TrimSpace(body))
+		resp, hErr := ep.HandleMessage(ctx, bytes.TrimSpace(body))
 		if hErr == nil && len(resp) > 0 && ok {
 			select {
 			case respCh <- resp:

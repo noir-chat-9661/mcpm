@@ -38,13 +38,15 @@ func parseArgs(argv []string) cliArgs {
 		multiFlags: map[string][]string{},
 	}
 	boolFlags := map[string]bool{
-		"f":       true,
-		"no-tui":  true,
-		"daemon":  true,
-		"http":    true,
-		"no-disc": true,
-		"help":    true,
-		"h":       true,
+		"f":          true,
+		"no-tui":     true,
+		"daemon":     true,
+		"http":       true,
+		"unified":    true,
+		"per-server": true,
+		"no-disc":    true,
+		"help":       true,
+		"h":          true,
 	}
 	for i := 0; i < len(argv); i++ {
 		s := argv[i]
@@ -108,10 +110,11 @@ func run(a cliArgs) error {
 		return runPS(a.flags["format"] == "json")
 
 	case "connect":
-		if len(a.positional) == 0 {
-			return errors.New("使い方: mcpm connect <MCPサーバー名>")
+		name := ""
+		if len(a.positional) > 0 {
+			name = a.positional[0]
 		}
-		return runConnect(a.positional[0])
+		return runConnect(name)
 
 	case "up", "start-unit", "stop", "close", "restart":
 		if len(a.positional) == 0 {
@@ -389,6 +392,7 @@ func cmdClientConfig(a cliArgs) error {
 		exe = "mcpm"
 	}
 	useHTTP := a.flags["http"] == "true"
+	perServer := a.flags["per-server"] == "true"
 	gwPort := cfg.GatewayPort
 	if gwPort == 0 {
 		gwPort = core.DefaultGatewayPort
@@ -396,22 +400,35 @@ func cmdClientConfig(a cliArgs) error {
 
 	out := map[string]any{}
 	servers := map[string]any{}
-	for _, name := range cfg.SortedServerNames() {
-		sc := cfg.Servers[name]
+	if !perServer {
 		if useHTTP {
-			if sc.Port > 0 {
-				servers[name] = map[string]any{
-					"url": fmt.Sprintf("http://127.0.0.1:%d/mcp", sc.Port),
+			servers["mcpm"] = map[string]any{
+				"url": fmt.Sprintf("http://127.0.0.1:%d/mcp", gwPort),
+			}
+		} else {
+			servers["mcpm"] = map[string]any{
+				"command": exe,
+				"args":    []string{"connect"},
+			}
+		}
+	} else {
+		for _, name := range cfg.SortedServerNames() {
+			sc := cfg.Servers[name]
+			if useHTTP {
+				if sc.Port > 0 {
+					servers[name] = map[string]any{
+						"url": fmt.Sprintf("http://127.0.0.1:%d/mcp", sc.Port),
+					}
+				} else {
+					servers[name] = map[string]any{
+						"url": fmt.Sprintf("http://127.0.0.1:%d/mcp/%s", gwPort, name),
+					}
 				}
 			} else {
 				servers[name] = map[string]any{
-					"url": fmt.Sprintf("http://127.0.0.1:%d/mcp/%s", gwPort, name),
+					"command": exe,
+					"args":    []string{"connect", name},
 				}
-			}
-		} else {
-			servers[name] = map[string]any{
-				"command": exe,
-				"args":    []string{"connect", name},
 			}
 		}
 	}
@@ -545,7 +562,7 @@ mcpm 自体は操作・ブリッジ用のクライアント（叩き台）であ
                                         実プロセス mcpmd を起動する
   mcpm tui                              稼働中の mcpmd に TUI で接続する
   mcpm ps [--format json]               状態一覧を表示する
-  mcpm connect <name>                   MCP クライアント用 stdio ブリッジ（mcpmd 自動起動）
+  mcpm connect [<name>]                 MCP クライアント用 stdio ブリッジ（引数省略で全サーバー統括モード）
   mcpm up <name> [--reason <理由>]      手動で MCP プロセスを起動（ウォームアップ）
   mcpm close <name> [--reason <理由>]   MCP プロセスを kill して待機状態に戻す（stop も同義）
   mcpm restart <name> [--reason <理由>] MCP プロセスを再起動する
@@ -555,7 +572,8 @@ mcpm 自体は操作・ブリッジ用のクライアント（叩き台）であ
   mcpm remove <name>                    MCP サーバーの登録を削除する
   mcpm import <json-file> [--base-port <N>]
                                         既存の mcpServers 設定 JSON をインポートする
-  mcpm client-config [--http]           クライアントに設定する mcpServers JSON を出力する
+  mcpm client-config [--http] [--per-server]
+                                        クライアントに設定する mcpServers JSON を出力する（デフォルトは統括1エントリ）
   mcpm logs <name> [-n <行数>] [-f]     ログを表示する（_daemon で mcpmd のログ）
   mcpm shutdown                         実プロセス (mcpmd) と全 MCP プロセスを完全停止する
 `)

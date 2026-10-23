@@ -80,11 +80,9 @@ func spawnDetachedDaemon(warm []string) error {
 }
 
 // runConnect は MCP クライアント（stdio）と別プロセスの mcpmd（UDS）をつなぐブリッジを実行する。
+// name が空（または "all"）の場合は全登録 MCP サーバーを束ねる統括モードで接続する。
 func runConnect(name string) error {
 	name = strings.TrimSpace(name)
-	if name == "" {
-		return errors.New("使い方: mcpm connect <MCPサーバー名>")
-	}
 
 	conn, err := ensureDaemonRunning(nil)
 	if err != nil {
